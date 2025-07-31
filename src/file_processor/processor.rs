@@ -13,10 +13,11 @@ const LOG_TARGET: &str = "file_processor::processor";
 
 #[derive(Debug)]
 pub struct FileProcessResult {
-    original_file_name: String,
-    number_of_chunks: u64,
-    chunks_directory: PathBuf,
-    // TODO: add merkle tree root hash
+    pub original_file_name: String,
+    pub number_of_chunks: u64,
+    pub chunks_directory: PathBuf,
+    pub merkle_root: [u8; 32],
+    pub merkle_proofs: HashMap<usize, Vec<u8>>,
 }
 
 impl FileProcessResult {
@@ -24,11 +25,15 @@ impl FileProcessResult {
         original_file_name: String,
         number_of_chunks: u64,
         chunks_directory: PathBuf,
+        merkle_root: [u8; 32],
+        merkle_proofs: HashMap<usize, Vec<u8>>,
     ) -> Self {
         Self {
             original_file_name,
             number_of_chunks,
             chunks_directory,
+            merkle_root,
+            merkle_proofs,
         }
     }
 }
@@ -67,7 +72,14 @@ impl Processor {
 
         let pieces_dir = containing_dir.join(format!("{}_chunks", file_name.replace(".", "_")));
         info!(target: LOG_TARGET, "Chunks dir: {:?}", pieces_dir.as_path());
-        // TODO: delete dir before create
+        tokio::fs::remove_dir_all(pieces_dir.clone())
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "Failed to delete chunks directory ({:?}): error",
+                    pieces_dir.as_path()
+                ))
+            })?;
         tokio::fs::create_dir_all(pieces_dir.clone())
             .await
             .map_err(|error| {
@@ -84,6 +96,7 @@ impl Processor {
         let mut buffer = [0; 1024];
         let mut reader = BufReader::new(file);
         let mut chunk_number = 1;
+        let mut merkle_tree = MerkleTree::<Sha256>::new();
         loop {
             let mut to_write = Vec::<u8>::with_capacity(CHUNK_SIZE);
             let mut n = 0;
@@ -99,6 +112,8 @@ impl Processor {
                 }
             }
 
+            merkle_tree.insert(Sha256::hash(to_write.as_slice()));
+
             let target_dir = pieces_dir.join(format!("{}.chunk", chunk_number));
             tokio::fs::write(target_dir, to_write)
                 .await
@@ -113,10 +128,23 @@ impl Processor {
             }
         }
 
+        merkle_tree.commit();
+        let merkle_root = merkle_tree.root().ok_or(Status::internal(
+            "Failed to get merkle root hash for chunks!",
+        ))?;
+
+        let mut merkle_proofs = HashMap::with_capacity(chunk_number);
+        for i in 0..chunk_number {
+            let proof = merkle_tree.proof(&[i]);
+            merkle_proofs.insert(i, proof.to_bytes());
+        }
+
         Ok(FileProcessResult::new(
             file_name.to_string(),
             chunk_number-1,
             pieces_dir,
+            merkle_root,
+            merkle_proofs,
         ))
     }
 }
