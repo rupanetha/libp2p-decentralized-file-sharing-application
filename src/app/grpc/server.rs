@@ -30,6 +30,8 @@ pub enum GrpcServerError {
     AddressParse(#[from] AddrParseError),
 }
 
+// TODO: refactor/changing publish service to include file download requests
+
 #[derive(Debug)]
 pub struct PublishService {
     file_publish_tx: mpsc::Sender<FileProcessResult>,

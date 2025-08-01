@@ -10,7 +10,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{file_processor::FileProcessResult, file_store::rocksdb::{RocksDb, RocksDbStoreError}};
+use crate::{
+    file_processor::FileProcessResult,
+    file_store::rocksdb::{RocksDb, RocksDbStoreError},
+};
 
 use super::{
     config::P2pServiceConfig,
