@@ -1,10 +1,14 @@
 use std::sync::mpsc::channel;
-use anyhow::Ok;
+
 use app::Server;
-mod app;
+
+pub mod app;
+pub mod file_processor;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    env_logger::init();
+
     // termination handler
     let (term_tx, term_rx) = channel();
     ctrlc::set_handler(move || term_tx.send(()).expect("Can't send signal on channel"))?;
@@ -21,5 +25,3 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-
-

@@ -10,8 +10,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::file_processor::FileProcessResult;
+
 use super::{
     config::P2pServiceConfig,
+    grpc::server::{GrpcServerError, GrpcService},
     service::{P2pNetworkError, P2pService},
 };
 
@@ -23,6 +26,8 @@ pub enum ServerError {
     TaskJoin(#[from] JoinError),
     #[error("P2P network error: {0}")]
     P2pNetwork(#[from] P2pNetworkError),
+    #[error("Grpc server error: {0}")]
+    GrpcServer(#[from] GrpcServerError),
 }
 
 pub type ServerResult<T> = Result<T, ServerError>;
@@ -34,7 +39,7 @@ pub struct Server {
 
 #[async_trait]
 pub trait Service: Send + Sync + 'static {
-    async fn start(&self, cancel_token: CancellationToken) -> Result<(), ServerError>;
+    async fn start(&mut self, cancel_token: CancellationToken) -> Result<(), ServerError>;
 }
 
 impl Server {
@@ -46,18 +51,26 @@ impl Server {
     }
 
     pub async fn start(&self) -> ServerResult<()> {
+        let (file_publish_tx, file_publish_rx) =
+            tokio::sync::mpsc::channel::<FileProcessResult>(100);
+
         // p2p service
         let p2p_service = P2pService::new(
             P2pServiceConfig::builder()
                 .with_keypair_file("./keys.keypair")
                 .build(),
+            file_publish_rx,
         );
         self.spawn_task(p2p_service).await?;
+
+        // grpc service
+        let grpc_service = GrpcService::new(9999, file_publish_tx);
+        self.spawn_task(grpc_service).await?;
 
         Ok(())
     }
 
-    async fn spawn_task<S: Service>(&self, service: S) -> ServerResult<()> {
+    async fn spawn_task<S: Service>(&self, mut service: S) -> ServerResult<()> {
         let mut handles = self.subtasks.lock().await;
         let cancel_token = self.cancel_token.clone();
         handles.push(tokio::spawn(
