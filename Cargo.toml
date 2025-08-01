@@ -19,6 +19,7 @@ thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["full"] }
 tokio-util = "0.7.13"
 tonic = "0.12.3"
+rocksdb = "0.23.0"
 
 [build-dependencies]
 tonic-build = "0.10"

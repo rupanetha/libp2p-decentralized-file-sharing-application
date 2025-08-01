@@ -10,7 +10,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::file_processor::FileProcessResult;
+use crate::{file_processor::FileProcessResult, file_store::rocksdb::{RocksDb, RocksDbStoreError}};
 
 use super::{
     config::P2pServiceConfig,
@@ -28,6 +28,8 @@ pub enum ServerError {
     P2pNetwork(#[from] P2pNetworkError),
     #[error("Grpc server error: {0}")]
     GrpcServer(#[from] GrpcServerError),
+    #[error("RocksDB store error: {0}")]
+    RocksDBStore(#[from] RocksDbStoreError),
 }
 
 pub type ServerResult<T> = Result<T, ServerError>;
@@ -54,12 +56,15 @@ impl Server {
         let (file_publish_tx, file_publish_rx) =
             tokio::sync::mpsc::channel::<FileProcessResult>(100);
 
+        let file_store = RocksDb::new("./file_store")?;
+
         // p2p service
         let p2p_service = P2pService::new(
             P2pServiceConfig::builder()
                 .with_keypair_file("./keys.keypair")
                 .build(),
             file_publish_rx,
+            file_store,
         );
         self.spawn_task(p2p_service).await?;
 

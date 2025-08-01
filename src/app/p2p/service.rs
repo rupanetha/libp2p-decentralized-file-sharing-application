@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::{models::PublishedFile, ServerError, Service},
-    file_processor::FileProcessResult,
+    file_processor::FileProcessResult, file_store::{self, PublishedFileRecord},
 };
 
 use super::config::P2pServiceConfig;
@@ -80,19 +80,22 @@ pub struct P2pNetworkBehaviour {
 }
 
 #[derive(Debug)]
-pub struct P2pService {
+pub struct P2pService<F: file_store::Store + Send + Sync + 'static> {
     config: P2pServiceConfig,
     file_publish_rx: mpsc::Receiver<FileProcessResult>,
+    file_store: F,
 }
 
-impl P2pService {
+impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
     pub fn new(
         config: P2pServiceConfig,
         file_publish_rx: mpsc::Receiver<FileProcessResult>,
+        file_store: F,
     ) -> Self {
         Self {
             config,
             file_publish_rx,
+            file_store,
         }
     }
 
@@ -307,6 +310,13 @@ impl P2pService {
                 if let Err(error) = swarm.behaviour_mut().kademlia.start_providing(record_key) {
                     error!(target: LOG_TARGET, "Failed to start providing a new record to DHT: {error}");
                 }
+                // TODO: add new published file to a published file store
+                if let Err(error) = self.file_store.add_published_file(file_process_result.into()) {
+                    error!(target: LOG_TARGET, "Failed to add new published file to file store: {error}");
+                }
+                
+                // TODO: implement p2p req-resp protocol to download metadata (metadata.cbor)
+                // TODO: implement p2p req-resp protocol to download a specific chunk
                 // TODO: putting all chunks as new records and start providing them (the same should be done at other peers who are downloaded a chunk)
                 // TODO: start publishing new file periodically to other peers via gossipsub if file_process_result.public == true
             }
@@ -326,7 +336,7 @@ impl P2pService {
 }
 
 #[async_trait]
-impl Service for P2pService {
+impl<F: file_store::Store + Send + Sync + 'static> Service for P2pService<F> {
     async fn start(&mut self, cancel_token: CancellationToken) -> Result<(), ServerError> {
         let mut swarm = self.swarm().await?;
         swarm

@@ -4,6 +4,7 @@ use app::Server;
 
 pub mod app;
 pub mod file_processor;
+pub mod file_store;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
