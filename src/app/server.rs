@@ -4,9 +4,8 @@ use async_trait::async_trait;
 use log::info;
 use thiserror::Error;
 use tokio::{
-    select,
     sync::Mutex,
-    task::{JoinError, JoinHandle, JoinSet},
+    task::{JoinError, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -18,7 +17,7 @@ use crate::{
 use super::{
     config::P2pServiceConfig,
     grpc::server::{GrpcServerError, GrpcService},
-    service::{P2pNetworkError, P2pService},
+    service::{P2pCommand, P2pNetworkError, P2pService},
 };
 
 const LOG_TARGET: &str = "app::server";
@@ -58,6 +57,7 @@ impl Server {
     pub async fn start(&self) -> ServerResult<()> {
         let (file_publish_tx, file_publish_rx) =
             tokio::sync::mpsc::channel::<FileProcessResult>(100);
+        let (p2p_command_tx, p2p_command_rx) = tokio::sync::mpsc::channel::<P2pCommand>(100);
 
         let file_store = RocksDb::new("./file_store")?;
 
@@ -68,11 +68,12 @@ impl Server {
                 .build(),
             file_publish_rx,
             file_store,
+            p2p_command_rx,
         );
         self.spawn_task(p2p_service).await?;
 
         // grpc service
-        let grpc_service = GrpcService::new(9999, file_publish_tx);
+        let grpc_service = GrpcService::new(9999, file_publish_tx, p2p_command_tx.clone());
         self.spawn_task(grpc_service).await?;
 
         Ok(())

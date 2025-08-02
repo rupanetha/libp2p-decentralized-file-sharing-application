@@ -1,28 +1,23 @@
-use std::fmt::format;
 use std::net::AddrParseError;
-use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use log::{error, info};
-use rs_merkle::algorithms::Sha256;
-use rs_merkle::{Hasher, MerkleProof};
 use thiserror::Error;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
-use tonic::{IntoRequest, Request, Response, Status};
+use tonic::{Request, Response};
 
-use crate::app::publish::publish_server::PublishServer;
-use crate::app::publish::PublishFileResponse;
+use crate::app::dfs_grpc::dfs_server::DfsServer;
+use crate::app::dfs_grpc::PublishFileResponse;
+use crate::app::service::{MetadataDownloadRequest, P2pCommand};
 use crate::app::{ServerError, Service};
 use crate::file_processor::{self, FileProcessResult};
 
-use super::publish::publish_server::Publish;
-use super::publish::PublishFileRequest;
+use super::dfs_grpc::dfs_server::Dfs;
+use super::dfs_grpc::{DownloadRequest, DownloadResponse, PublishFileRequest};
 
-const LOG_TARGET: &str = "grpc::publish";
+const LOG_TARGET: &str = "grpc";
 
 #[derive(Debug, Error)]
 pub enum GrpcServerError {
@@ -30,21 +25,26 @@ pub enum GrpcServerError {
     AddressParse(#[from] AddrParseError),
 }
 
-// TODO: refactor/changing publish service to include file download requests
-
 #[derive(Debug)]
-pub struct PublishService {
+pub struct DfsGrpcService {
     file_publish_tx: mpsc::Sender<FileProcessResult>,
+    p2p_command_sender: mpsc::Sender<P2pCommand>,
 }
 
-impl PublishService {
-    pub fn new(file_publish_tx: mpsc::Sender<FileProcessResult>) -> Self {
-        Self { file_publish_tx }
+impl DfsGrpcService {
+    pub fn new(
+        file_publish_tx: mpsc::Sender<FileProcessResult>,
+        p2p_command_sender: mpsc::Sender<P2pCommand>,
+    ) -> Self {
+        Self {
+            file_publish_tx,
+            p2p_command_sender,
+        }
     }
 }
 
 #[tonic::async_trait]
-impl Publish for PublishService {
+impl Dfs for DfsGrpcService {
     async fn publish_file(
         &self,
         request: Request<PublishFileRequest>,
@@ -86,18 +86,58 @@ impl Publish for PublishService {
             error: String::new(),
         }))
     }
+
+    async fn download(
+        &self,
+        request: Request<DownloadRequest>,
+    ) -> Result<tonic::Response<DownloadResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let (tx, rx) = oneshot::channel();
+        self.p2p_command_sender
+            .send(P2pCommand::RequestMetadata {
+                request: MetadataDownloadRequest {
+                    file_id: req.file_id,
+                },
+                result: tx,
+            })
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!("Failed to get file metadata: {error:?}"))
+            })?;
+        let result = rx.await.map_err(|error| {
+            tonic::Status::internal(format!("Failed to get file metadata: {error:?}"))
+        })?;
+
+        info!(target: LOG_TARGET, "Downloaded metadata: {:?}", result);
+
+        // TODO: add a new field to DownloadRequest about where to download resulting files
+        // TODO: save metadata file to local DB (into a new column family for downloading chunks)
+        // TODO: start parallel file download (provide files on DHT when downloaded and verified)
+
+        // TODO: implement rest
+        Ok(Response::new(DownloadResponse {
+            success: true,
+            error: "".to_string(),
+        }))
+    }
 }
 
 pub struct GrpcService {
     port: u16,
     file_publish_tx: mpsc::Sender<FileProcessResult>,
+    p2p_command_sender: mpsc::Sender<P2pCommand>,
 }
 
 impl GrpcService {
-    pub fn new(port: u16, file_publish_tx: mpsc::Sender<FileProcessResult>) -> Self {
+    pub fn new(
+        port: u16,
+        file_publish_tx: mpsc::Sender<FileProcessResult>,
+        p2p_command_sender: mpsc::Sender<P2pCommand>,
+    ) -> Self {
         Self {
             port,
             file_publish_tx,
+            p2p_command_sender,
         }
     }
 }
@@ -111,8 +151,9 @@ impl Service for GrpcService {
             .map_err(|error| GrpcServerError::AddressParse(error))?;
         info!(target: LOG_TARGET, "Grpc server is starting at {grpc_address}!");
         if let Err(error) = Server::builder()
-            .add_service(PublishServer::new(PublishService::new(
+            .add_service(DfsServer::new(DfsGrpcService::new(
                 self.file_publish_tx.clone(),
+                self.p2p_command_sender.clone(),
             )))
             .serve_with_shutdown(grpc_address, cancel_token.cancelled())
             .await

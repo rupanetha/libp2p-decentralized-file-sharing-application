@@ -1,7 +1,7 @@
-use core::error;
 use std::{
+    collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,25 +12,29 @@ use libp2p::{
     gossipsub::{self, IdentTopic, SubscriptionError},
     identify::{self, Info},
     identity::{DecodingError, Keypair},
-    kad::{self, store::MemoryStore, Mode, Record},
+    kad::{
+        self, store::MemoryStore, GetProvidersOk, Mode, QueryId, QueryResult, Record, RecordKey,
+    },
     mdns,
     multiaddr::{self, Protocol},
     noise, ping, relay,
-    request_response::{self, cbor},
+    request_response::{self, cbor, OutboundRequestId},
     swarm::NetworkBehaviour,
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, TransportError,
 };
 use log::{debug, error, info, warn};
-use rs_sha256::Sha256Hasher;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{io, select, sync::mpsc};
+use tokio::{
+    io, select,
+    sync::{broadcast, mpsc, oneshot},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::{models::PublishedFile, ServerError, Service},
-    file_processor::FileProcessResult,
-    file_store::{self, PublishedFileRecord},
+    file_processor::{FileProcessResult, FileProcessResultHash},
+    file_store::{self},
 };
 
 use super::config::P2pServiceConfig;
@@ -56,6 +60,13 @@ pub struct MetadataDownloadRequest {
 pub enum MetadataDownloadResponse {
     Success(Vec<u8>),
     Error(String),
+}
+
+pub enum P2pCommand {
+    RequestMetadata {
+        request: MetadataDownloadRequest,
+        result: oneshot::Sender<Option<FileProcessResult>>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -95,10 +106,20 @@ pub struct P2pNetworkBehaviour {
 // TODO: implement a command channel (with one-shot response channel) to do any operations with p2p
 
 #[derive(Debug)]
+struct MetadataDownloadRequestData {
+    pub get_providers_query_id: QueryId,
+    pub download_metadata_request_id: Option<OutboundRequestId>,
+    pub request: MetadataDownloadRequest,
+    pub result: Option<oneshot::Sender<Option<FileProcessResult>>>,
+}
+
+#[derive(Debug)]
 pub struct P2pService<F: file_store::Store + Send + Sync + 'static> {
     config: P2pServiceConfig,
     file_publish_rx: mpsc::Receiver<FileProcessResult>,
     file_store: F,
+    commands_rx: mpsc::Receiver<P2pCommand>,
+    metadata_download_requests: Vec<MetadataDownloadRequestData>,
 }
 
 impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
@@ -106,11 +127,14 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
         config: P2pServiceConfig,
         file_publish_rx: mpsc::Receiver<FileProcessResult>,
         file_store: F,
+        commands_rx: mpsc::Receiver<P2pCommand>,
     ) -> Self {
         Self {
             config,
             file_publish_rx,
             file_store,
+            commands_rx,
+            metadata_download_requests: vec![],
         }
     }
 
@@ -296,7 +320,7 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
     }
 
     async fn handle_metadata_download_message(
-        &self,
+        &mut self,
         swarm: &mut Swarm<P2pNetworkBehaviour>,
         peer_id: PeerId,
         message: libp2p::request_response::Message<
@@ -312,39 +336,46 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
             } => {
                 info!(target: LOG_TARGET, "Metadata download request: {request:?}");
                 if let Ok(true) = self.file_store.published_file_exists(request.file_id) {
-                    let metadata_path_result = self.file_store.published_file_metadata_path(request.file_id);
+                    let metadata_path_result = self
+                        .file_store
+                        .published_file_metadata_path(request.file_id);
                     match metadata_path_result {
                         Ok(metada_path) => {
                             let metada_content_result = tokio::fs::read(metada_path).await;
                             match metada_content_result {
                                 Ok(metadata_content) => {
-                                    if let Err(error) = swarm.behaviour_mut().metadata_download.send_response(
-                                        channel,
-                                        MetadataDownloadResponse::Success(metadata_content),
-                                    ) {
+                                    if let Err(error) =
+                                        swarm.behaviour_mut().metadata_download.send_response(
+                                            channel,
+                                            MetadataDownloadResponse::Success(metadata_content),
+                                        )
+                                    {
                                         error!(target: LOG_TARGET, "Failed to send back metadata download response: {error:?}");
                                     }
-                                },
+                                }
                                 Err(error) => {
-                                    if let Err(error) = swarm.behaviour_mut().metadata_download.send_response(
-                                        channel,
-                                        MetadataDownloadResponse::Error(error.to_string()),
-                                    ) {
+                                    if let Err(error) =
+                                        swarm.behaviour_mut().metadata_download.send_response(
+                                            channel,
+                                            MetadataDownloadResponse::Error(error.to_string()),
+                                        )
+                                    {
                                         error!(target: LOG_TARGET, "Failed to send back metadata download response: {error:?}");
                                     }
-                                },
+                                }
                             }
-                        },
+                        }
                         Err(error) => {
-                            if let Err(error) = swarm.behaviour_mut().metadata_download.send_response(
-                                channel,
-                                MetadataDownloadResponse::Error(error.to_string()),
-                            ) {
+                            if let Err(error) =
+                                swarm.behaviour_mut().metadata_download.send_response(
+                                    channel,
+                                    MetadataDownloadResponse::Error(error.to_string()),
+                                )
+                            {
                                 error!(target: LOG_TARGET, "Failed to send back metadata download response: {error:?}");
                             }
-                        },
+                        }
                     }
-
                 } else {
                     if let Err(error) = swarm.behaviour_mut().metadata_download.send_response(
                         channel,
@@ -361,20 +392,43 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
                 info!(target: LOG_TARGET, "Metadata download response received: {response:?}");
                 match response {
                     MetadataDownloadResponse::Success(raw_metadata) => {
-                        let metadata_result: Result<FileProcessResult, serde_cbor::Error> = serde_cbor::from_slice(raw_metadata.as_slice());
+                        let metadata_result: Result<FileProcessResult, serde_cbor::Error> =
+                            serde_cbor::from_slice(raw_metadata.as_slice());
                         match metadata_result {
                             Ok(metadata) => {
                                 info!(target:LOG_TARGET, "New metadata downloaded: {:?} ({:?})", metadata.original_file_name, metadata.merkle_root);
+                                if let Some(data) =
+                                    self.metadata_download_requests.iter_mut().find(|data| {
+                                        data.download_metadata_request_id == Some(request_id)
+                                    })
+                                {
+                                    if let Some(result_sender) = data.result.take() {
+                                        if let Err(error) = result_sender.send(Some(metadata)) {
+                                            error!(target: LOG_TARGET, "Failed to send back result of metadata download: {error:?}");
+                                        }
+                                    }
+                                }
                                 // TODO: trigger/start chunks download (save metadata file as well into the target directory)
-                            },
+                            }
                             Err(error) => {
                                 error!(target: LOG_TARGET, "Failed to convert metadata from bytes: {error:?}");
-                            },
+                            }
                         }
-                    },
+                    }
                     MetadataDownloadResponse::Error(error) => {
                         error!(target: LOG_TARGET, "Failed to download metadata: {error:?}");
-                    },
+                        if let Some(data) =
+                                    self.metadata_download_requests.iter_mut().find(|data| {
+                                        data.download_metadata_request_id == Some(request_id)
+                                    })
+                                {
+                                    if let Some(result_sender) = data.result.take() {
+                                        if let Err(error) = result_sender.send(None) {
+                                            error!(target: LOG_TARGET, "Failed to send back result of metadata download: {error:?}");
+                                        }
+                                    }
+                                }
+                    }
                 }
             }
         }
@@ -445,6 +499,71 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
         }
     }
 
+    /// Handling internal P2P requests.
+    fn handle_command(&mut self, swarm: &mut Swarm<P2pNetworkBehaviour>, command: P2pCommand) {
+        match command {
+            P2pCommand::RequestMetadata { request, result } => {
+                let hash = FileProcessResultHash::new(request.file_id);
+                let key = RecordKey::new(&hash.to_array());
+                let query_id = swarm.behaviour_mut().kademlia.get_providers(key);
+                self.metadata_download_requests
+                    .push(MetadataDownloadRequestData {
+                        request,
+                        result: Some(result),
+                        get_providers_query_id: query_id,
+                        download_metadata_request_id: None,
+                    });
+            }
+        }
+    }
+
+    fn handle_get_providers_query_progressed(
+        &mut self,
+        swarm: &mut Swarm<P2pNetworkBehaviour>,
+        query_id: QueryId,
+        result: QueryResult,
+    ) {
+        if let QueryResult::GetProviders(providers_result) = result {
+            if let Some(data) = self
+                .metadata_download_requests
+                .iter()
+                .find(|data| data.get_providers_query_id == query_id)
+            {
+                let peer_id = match providers_result {
+                    Ok(providers) => match providers {
+                        GetProvidersOk::FoundProviders {
+                            key: _key,
+                            providers,
+                        } => providers.iter().next().cloned(),
+                        GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
+                            if !closest_peers.is_empty() {
+                                closest_peers.get(0).cloned()
+                            } else {
+                                None
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        error!(target: LOG_TARGET, "Failed to get providers: {error:?}");
+                        None
+                    }
+                };
+                if let Some(peer_id) = peer_id {
+                    let request_id = swarm
+                        .behaviour_mut()
+                        .metadata_download
+                        .send_request(&peer_id, data.request.clone());
+                    self.metadata_download_requests
+                        .iter_mut()
+                        .filter(|data| data.get_providers_query_id == query_id)
+                        .for_each(|data| {
+                            data.download_metadata_request_id = Some(request_id);
+                        });
+                }
+            }
+        }
+    }
+
     fn log_debug<T: std::fmt::Debug>(&self, event: T) {
         debug!(target: LOG_TARGET, "{:?}", event);
     }
@@ -496,7 +615,14 @@ impl<F: file_store::Store + Send + Sync + 'static> Service for P2pService<F> {
                             mdns::Event::Discovered(new_peers) => self.handle_mdns_discovered(&mut swarm, new_peers),
                             _ => self.log_debug(event),
                         },
-                        P2pNetworkBehaviourEvent::Kademlia(event) => self.log_info(event),
+                        P2pNetworkBehaviourEvent::Kademlia(event) => match event {
+                            kad::Event::OutboundQueryProgressed { id, result, stats: _stats, step: _step } => {
+                                if self.metadata_download_requests.iter().any(|value| value.get_providers_query_id == id) {
+                                    self.handle_get_providers_query_progressed(&mut swarm, id, result);
+                                }
+                            },
+                            _ => self.log_info(event),
+                        },
                         P2pNetworkBehaviourEvent::Gossipsub(event) => match event {
                             gossipsub::Event::Message { propagation_source: _propagation_source, message_id: _message_id, message } => self.handle_gossipsub_message(&mut swarm, message),
                             _ => self.log_debug(event),
@@ -522,6 +648,11 @@ impl<F: file_store::Store + Send + Sync + 'static> Service for P2pService<F> {
                 file_publish_result = self.file_publish_rx.recv() => {
                     if let Some(new_file_publish) = file_publish_result {
                         self.handle_file_publish(&mut swarm, new_file_publish);
+                    }
+                },
+                command = self.commands_rx.recv() => {
+                    if let Some(command) = command {
+                        self.handle_command(&mut swarm, command);
                     }
                 },
                 _ = cancel_token.cancelled() => {

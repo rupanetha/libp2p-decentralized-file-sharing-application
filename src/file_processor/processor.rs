@@ -9,7 +9,7 @@ use tokio::io::AsyncReadExt;
 use tokio::{fs::File, io::BufReader};
 use tonic::Status;
 
-use crate::app::publish::PublishFileRequest;
+use crate::app::dfs_grpc::PublishFileRequest;
 
 const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB
 pub const PROCESSING_RESULT_FILE_NAME: &str = "metadata.cbor";
@@ -42,6 +42,10 @@ impl FileProcessResultHash {
     pub fn to_bytes(&self) -> Vec<u8> {
         let result: [u8; 8] = self.into();
         result.to_vec()
+    }
+
+    pub fn to_array(&self) -> [u8; 8] {
+        self.into()
     }
 }
 
