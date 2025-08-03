@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{option::Iter, path::PathBuf};
 
 use log::error;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options};
@@ -78,5 +78,25 @@ impl Store for RocksDb {
             .try_into()
             .map_err(|error| super::Error::RocksDbStore(RocksDbStoreError::Cbor(error)))?;
         Ok(result.chunks_directory.join(PROCESSING_RESULT_FILE_NAME))
+    }
+
+    fn fetch_all_published_files(
+        &self,
+    ) -> Result<impl Iterator<Item = PublishedFileRecord>, super::Error> {
+        let cf = self.column_family(PUBLISHED_FILES_COLUMN_FAMILY_NAME)?;
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::Start)
+            .filter_map(|result| {
+                if let Ok((_, value)) = result {
+                    let value_result: Result<PublishedFileRecord, serde_cbor::Error> =
+                        value.to_vec().try_into();
+                    if let Ok(record) = value_result {
+                        return Some(record);
+                    }
+                }
+                None
+            });
+        Ok(iter)
     }
 }

@@ -75,7 +75,7 @@ impl Server {
 
         // create dir if not exists
         tokio::fs::create_dir_all(&self.cli.base_path).await?;
-        
+
         Ok(())
     }
 
@@ -99,7 +99,8 @@ impl Server {
         self.spawn_task(p2p_service).await?;
 
         // grpc service
-        let grpc_service = GrpcService::new(self.cli.grpc_port, file_publish_tx, p2p_command_tx.clone());
+        let grpc_service =
+            GrpcService::new(self.cli.grpc_port, file_publish_tx, p2p_command_tx.clone());
         self.spawn_task(grpc_service).await?;
 
         Ok(())

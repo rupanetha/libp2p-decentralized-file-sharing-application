@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use ::rocksdb::DBIteratorWithThreadMode;
 use rocksdb::RocksDbStoreError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -75,4 +76,6 @@ pub trait Store {
     fn add_published_file(&self, record: PublishedFileRecord) -> Result<(), Error>;
     fn published_file_exists(&self, file_id: u64) -> Result<bool, Error>;
     fn published_file_metadata_path(&self, file_id: u64) -> Result<PathBuf, Error>;
+    fn fetch_all_published_files(&self)
+        -> Result<impl Iterator<Item = PublishedFileRecord>, Error>;
 }

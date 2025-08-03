@@ -108,7 +108,9 @@ impl Dfs for DfsGrpcService {
             tonic::Status::internal(format!("Failed to get file metadata: {error:?}"))
         })?;
 
-        info!(target: LOG_TARGET, "Downloaded metadata: {:?}", result);
+        if let Some(result) = result {
+            info!(target: LOG_TARGET, "Downloaded metadata for: {:?}", result.original_file_name);
+        }
 
         // TODO: add a new field to DownloadRequest about where to download resulting files
         // TODO: save metadata file to local DB (into a new column family for downloading chunks)

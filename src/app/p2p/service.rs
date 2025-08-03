@@ -1,8 +1,5 @@
 use std::{
-    collections::HashMap,
-    hash::{DefaultHasher, Hash, Hasher},
-    path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::HashMap, fs, hash::{DefaultHasher, Hash, Hasher}, path::PathBuf, time::{Duration, SystemTime, UNIX_EPOCH}
 };
 
 use async_trait::async_trait;
@@ -33,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::{models::PublishedFile, ServerError, Service},
-    file_processor::{FileProcessResult, FileProcessResultHash},
+    file_processor::{FileProcessResult, FileProcessResultHash, PROCESSING_RESULT_FILE_NAME},
     file_store::{self},
 };
 
@@ -564,6 +561,39 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
         }
     }
 
+    fn start_providing_all_files(&mut self, swarm: &mut Swarm<P2pNetworkBehaviour>,) {
+        if let Ok(published_files) = self.file_store.fetch_all_published_files() {
+            for published_file in published_files {
+                let metadata_path = published_file
+                    .chunks_directory
+                    .join(PROCESSING_RESULT_FILE_NAME);
+                let metada_content_result = fs::read(metadata_path);
+                if let Ok(metada_content_raw) = metada_content_result {
+                    let metadata_result: Result<FileProcessResult, serde_cbor::Error> =
+                        serde_cbor::from_slice(metada_content_raw.as_slice());
+                    if let Ok(metadata) = metadata_result {
+                        info!(target: LOG_TARGET, "Start providing {} on kademlia DHT...", published_file.original_file_name);
+                        if let Ok(value) = serde_cbor::to_vec(&PublishedFile::new(
+                            metadata.number_of_chunks,
+                            metadata.merkle_root,
+                        )) {
+                            let record = Record::new(published_file.key(), value);
+                            if let Err(error) = swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .put_record(record, kad::Quorum::Majority)
+                            {
+                                error!(target: LOG_TARGET, "Failed to put a new record to DHT: {error}");
+                            }
+
+                            // TODO: we should start providing all the chunks too!
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn log_debug<T: std::fmt::Debug>(&self, event: T) {
         debug!(target: LOG_TARGET, "{:?}", event);
     }
@@ -602,6 +632,8 @@ impl<F: file_store::Store + Send + Sync + 'static> Service for P2pService<F> {
             })?;
 
         // TODO: add bootstrap peers
+
+        self.start_providing_all_files(&mut swarm);
 
         loop {
             select! {
