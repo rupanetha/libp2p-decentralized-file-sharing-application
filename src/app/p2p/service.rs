@@ -417,17 +417,17 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
                     }
                     MetadataDownloadResponse::Error(error) => {
                         error!(target: LOG_TARGET, "Failed to download metadata: {error:?}");
-                        if let Some(data) =
-                                    self.metadata_download_requests.iter_mut().find(|data| {
-                                        data.download_metadata_request_id == Some(request_id)
-                                    })
-                                {
-                                    if let Some(result_sender) = data.result.take() {
-                                        if let Err(error) = result_sender.send(None) {
-                                            error!(target: LOG_TARGET, "Failed to send back result of metadata download: {error:?}");
-                                        }
-                                    }
+                        if let Some(data) = self
+                            .metadata_download_requests
+                            .iter_mut()
+                            .find(|data| data.download_metadata_request_id == Some(request_id))
+                        {
+                            if let Some(result_sender) = data.result.take() {
+                                if let Err(error) = result_sender.send(None) {
+                                    error!(target: LOG_TARGET, "Failed to send back result of metadata download: {error:?}");
                                 }
+                            }
+                        }
                     }
                 }
             }

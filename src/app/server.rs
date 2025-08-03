@@ -1,15 +1,17 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use log::info;
 use thiserror::Error;
 use tokio::{
+    io,
     sync::Mutex,
     task::{JoinError, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    cli::Cli,
     file_processor::FileProcessResult,
     file_store::rocksdb::{RocksDb, RocksDbStoreError},
 };
@@ -32,11 +34,16 @@ pub enum ServerError {
     GrpcServer(#[from] GrpcServerError),
     #[error("RocksDB store error: {0}")]
     RocksDBStore(#[from] RocksDbStoreError),
+    #[error("Failed to initialize base directory at {0}")]
+    InitBaseDir(PathBuf),
+    #[error("I/O error: {0}")]
+    IO(#[from] io::Error),
 }
 
 pub type ServerResult<T> = Result<T, ServerError>;
 
 pub struct Server {
+    cli: Cli,
     cancel_token: CancellationToken,
     subtasks: Arc<Mutex<Vec<JoinHandle<Result<(), ServerError>>>>>,
 }
@@ -47,24 +54,43 @@ pub trait Service: Send + Sync + 'static {
 }
 
 impl Server {
-    pub fn new() -> Self {
+    pub fn new(cli: Cli) -> Self {
         Self {
             cancel_token: CancellationToken::new(),
             subtasks: Arc::new(Mutex::new(vec![])),
+            cli,
         }
     }
 
+    async fn init_base_dir(&self) -> ServerResult<()> {
+        // return dir if exists
+        let metadata_result = tokio::fs::metadata(&self.cli.base_path).await;
+        if let Ok(metadata) = metadata_result {
+            if metadata.is_dir() {
+                return Ok(());
+            } else {
+                return Err(ServerError::InitBaseDir(self.cli.base_path.clone()));
+            }
+        }
+
+        // create dir if not exists
+        tokio::fs::create_dir_all(&self.cli.base_path).await?;
+        
+        Ok(())
+    }
+
     pub async fn start(&self) -> ServerResult<()> {
+        self.init_base_dir().await?;
         let (file_publish_tx, file_publish_rx) =
             tokio::sync::mpsc::channel::<FileProcessResult>(100);
         let (p2p_command_tx, p2p_command_rx) = tokio::sync::mpsc::channel::<P2pCommand>(100);
 
-        let file_store = RocksDb::new("./file_store")?;
+        let file_store = RocksDb::new(self.cli.base_path.join("file_store"))?;
 
         // p2p service
         let p2p_service = P2pService::new(
             P2pServiceConfig::builder()
-                .with_keypair_file("./keys.keypair")
+                .with_keypair_file(self.cli.base_path.join("keys.keypair"))
                 .build(),
             file_publish_rx,
             file_store,
@@ -73,7 +99,7 @@ impl Server {
         self.spawn_task(p2p_service).await?;
 
         // grpc service
-        let grpc_service = GrpcService::new(9999, file_publish_tx, p2p_command_tx.clone());
+        let grpc_service = GrpcService::new(self.cli.grpc_port, file_publish_tx, p2p_command_tx.clone());
         self.spawn_task(grpc_service).await?;
 
         Ok(())
