@@ -9,11 +9,13 @@ use crate::{
     file_store::PublishedFileRecord,
 };
 
-use super::Store;
+use super::{PendingDownloadRecord, Store};
 
 const LOG_TARGET: &str = "file_store::rocksdb";
 
 const PUBLISHED_FILES_COLUMN_FAMILY_NAME: &str = "published_files";
+const PENDING_DOWNLOADS_COLUMN_FAMILY_NAME: &str = "pending_downloads";
+const DOWNLOAD_PROGRESSES_COLUMN_FAMILY_NAME: &str = "download_progresses";
 
 pub struct RocksDb {
     db: rocksdb::DB,
@@ -34,9 +36,16 @@ impl RocksDb {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        let cfs = ColumnFamilyDescriptor::new(PUBLISHED_FILES_COLUMN_FAMILY_NAME, opts.clone());
+        let published_files_cf =
+            ColumnFamilyDescriptor::new(PUBLISHED_FILES_COLUMN_FAMILY_NAME, opts.clone());
+        let pending_downloads_cf =
+            ColumnFamilyDescriptor::new(PENDING_DOWNLOADS_COLUMN_FAMILY_NAME, opts.clone());
         Ok(Self {
-            db: rocksdb::DB::open_cf_descriptors(&opts, folder.into(), vec![cfs])?,
+            db: rocksdb::DB::open_cf_descriptors(
+                &opts,
+                folder.into(),
+                vec![published_files_cf, pending_downloads_cf],
+            )?,
         })
     }
 
@@ -90,6 +99,41 @@ impl Store for RocksDb {
             .filter_map(|result| {
                 if let Ok((_, value)) = result {
                     let value_result: Result<PublishedFileRecord, serde_cbor::Error> =
+                        value.to_vec().try_into();
+                    if let Ok(record) = value_result {
+                        return Some(record);
+                    }
+                }
+                None
+            });
+        Ok(iter)
+    }
+
+    fn add_pending_download(
+        &self,
+        record: super::PendingDownloadRecord,
+    ) -> Result<(), super::Error> {
+        let cf = self.column_family(PENDING_DOWNLOADS_COLUMN_FAMILY_NAME)?;
+        let key = record.key();
+        let value: Vec<u8> = record
+            .try_into()
+            .map_err(|error| RocksDbStoreError::Cbor(error))?;
+        self.db
+            .put_cf(cf, key, value)
+            .map_err(|error| RocksDbStoreError::RocksDb(error))?;
+        Ok(())
+    }
+
+    fn fetch_all_pending_downloads(
+        &self,
+    ) -> Result<impl Iterator<Item = super::PendingDownloadRecord> + Send + Sync, super::Error> {
+        let cf = self.column_family(PENDING_DOWNLOADS_COLUMN_FAMILY_NAME)?;
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::Start)
+            .filter_map(|result| {
+                if let Ok((_, value)) = result {
+                    let value_result: Result<PendingDownloadRecord, serde_cbor::Error> =
                         value.to_vec().try_into();
                     if let Ok(record) = value_result {
                         return Some(record);

@@ -17,7 +17,7 @@ message PublishFileResponse {
 }
 
 message DownloadRequest {
-    uint64 file_id = 1;
+    int32 file_id = 1;
 }
 
 message DownloadResponse {

@@ -7,3 +7,5 @@ pub use p2p::*;
 mod grpc;
 pub use grpc::*;
 
+mod file_download_service;
+pub use file_download_service::*;

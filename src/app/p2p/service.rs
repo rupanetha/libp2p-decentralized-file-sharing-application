@@ -1,5 +1,10 @@
 use std::{
-    collections::HashMap, fs, hash::{DefaultHasher, Hash, Hasher}, path::PathBuf, time::{Duration, SystemTime, UNIX_EPOCH}
+    collections::HashMap,
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -100,8 +105,6 @@ pub struct P2pNetworkBehaviour {
     metadata_download: cbor::Behaviour<MetadataDownloadRequest, MetadataDownloadResponse>,
 }
 
-// TODO: implement a command channel (with one-shot response channel) to do any operations with p2p
-
 #[derive(Debug)]
 struct MetadataDownloadRequestData {
     pub get_providers_query_id: QueryId,
@@ -114,7 +117,7 @@ struct MetadataDownloadRequestData {
 pub struct P2pService<F: file_store::Store + Send + Sync + 'static> {
     config: P2pServiceConfig,
     file_publish_rx: mpsc::Receiver<FileProcessResult>,
-    file_store: F,
+    file_store: Arc<F>,
     commands_rx: mpsc::Receiver<P2pCommand>,
     metadata_download_requests: Vec<MetadataDownloadRequestData>,
 }
@@ -123,7 +126,7 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
     pub fn new(
         config: P2pServiceConfig,
         file_publish_rx: mpsc::Receiver<FileProcessResult>,
-        file_store: F,
+        file_store: Arc<F>,
         commands_rx: mpsc::Receiver<P2pCommand>,
     ) -> Self {
         Self {
@@ -561,7 +564,7 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
         }
     }
 
-    fn start_providing_all_files(&mut self, swarm: &mut Swarm<P2pNetworkBehaviour>,) {
+    fn start_providing_all_files(&mut self, swarm: &mut Swarm<P2pNetworkBehaviour>) {
         if let Ok(published_files) = self.file_store.fetch_all_published_files() {
             for published_file in published_files {
                 let metadata_path = published_file
