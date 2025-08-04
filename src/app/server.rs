@@ -20,6 +20,7 @@ use super::{
     config::P2pServiceConfig,
     grpc::server::{GrpcServerError, GrpcService},
     service::{P2pCommand, P2pNetworkError, P2pService},
+    FileDownloadService,
 };
 
 const LOG_TARGET: &str = "app::server";
@@ -75,7 +76,7 @@ impl Server {
 
         // create dir if not exists
         tokio::fs::create_dir_all(&self.cli.base_path).await?;
-        
+
         Ok(())
     }
 
@@ -85,7 +86,7 @@ impl Server {
             tokio::sync::mpsc::channel::<FileProcessResult>(100);
         let (p2p_command_tx, p2p_command_rx) = tokio::sync::mpsc::channel::<P2pCommand>(100);
 
-        let file_store = RocksDb::new(self.cli.base_path.join("file_store"))?;
+        let file_store = Arc::new(RocksDb::new(self.cli.base_path.join("file_store"))?);
 
         // p2p service
         let p2p_service = P2pService::new(
@@ -93,14 +94,23 @@ impl Server {
                 .with_keypair_file(self.cli.base_path.join("keys.keypair"))
                 .build(),
             file_publish_rx,
-            file_store,
+            file_store.clone(),
             p2p_command_rx,
         );
         self.spawn_task(p2p_service).await?;
 
         // grpc service
-        let grpc_service = GrpcService::new(self.cli.grpc_port, file_publish_tx, p2p_command_tx.clone());
+        let grpc_service = GrpcService::new(
+            self.cli.grpc_port,
+            file_publish_tx,
+            p2p_command_tx.clone(),
+            file_store.clone(),
+        );
         self.spawn_task(grpc_service).await?;
+
+        // file download service
+        let file_download_service = FileDownloadService::new(file_store.clone());
+        self.spawn_task(file_download_service).await?;
 
         Ok(())
     }

@@ -27,7 +27,7 @@ pub struct FileProcessResult {
     pub public: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct FileProcessResultHash(u64);
 
 impl FileProcessResultHash {
