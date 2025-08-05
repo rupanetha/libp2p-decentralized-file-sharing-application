@@ -5,7 +5,7 @@ use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options};
 use thiserror::Error;
 
 use crate::{
-    file_processor::{FileProcessResultHash, PROCESSING_RESULT_FILE_NAME},
+    file_processor::{FileProcessResultHash, CHUNK_FILES_EXTENSION, PROCESSING_RESULT_FILE_NAME},
     file_store::PublishedFileRecord,
 };
 
@@ -109,6 +109,31 @@ impl Store for RocksDb {
         Ok(iter)
     }
 
+    fn fetch_published_file_chunk_path(
+        &self,
+        id: &FileProcessResultHash,
+        chunk_id: usize,
+    ) -> Result<Option<PathBuf>, super::Error> {
+        let cf = self.column_family(PUBLISHED_FILES_COLUMN_FAMILY_NAME)?;
+        let raw_published_file_result = self
+            .db
+            .get_cf(cf, id.to_bytes())
+            .map_err(|error| super::Error::RocksDbStore(RocksDbStoreError::RocksDb(error)))?;
+        if raw_published_file_result.is_none() {
+            return Ok(None);
+        }
+        let raw_published_file = raw_published_file_result.unwrap();
+        let published_file: PublishedFileRecord = raw_published_file
+            .to_vec()
+            .try_into()
+            .map_err(|error| super::Error::RocksDbStore(RocksDbStoreError::Cbor(error)))?;
+        Ok(Some(
+            published_file
+                .chunks_directory
+                .join(format!("{}.{}", chunk_id, CHUNK_FILES_EXTENSION)),
+        ))
+    }
+
     fn add_pending_download(
         &self,
         record: super::PendingDownloadRecord,
@@ -143,5 +168,96 @@ impl Store for RocksDb {
                 None
             });
         Ok(iter)
+    }
+
+    fn add_downloaded_chunk_to_pending_download(
+        &self,
+        id: FileProcessResultHash,
+        chunk_id: usize,
+    ) -> Result<(), super::Error> {
+        let cf = self.column_family(PENDING_DOWNLOADS_COLUMN_FAMILY_NAME)?;
+        if let Some(value) = self
+            .db
+            .get_cf(cf, id.to_bytes())
+            .map_err(|error| super::Error::RocksDbStore(RocksDbStoreError::RocksDb(error)))?
+        {
+            let value_result: Result<PendingDownloadRecord, serde_cbor::Error> =
+                value.to_vec().try_into();
+            if let Ok(mut record) = value_result {
+                record.downloaded_chunks.insert(chunk_id, ());
+                self.add_pending_download(record)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn already_downloaded_chunks_in_pending_download(
+        &self,
+        id: &FileProcessResultHash,
+    ) -> Result<Vec<u64>, super::Error> {
+        let cf = self.column_family(PENDING_DOWNLOADS_COLUMN_FAMILY_NAME)?;
+        if let Some(value) = self
+            .db
+            .get_cf(cf, id.to_bytes())
+            .map_err(|error| super::Error::RocksDbStore(RocksDbStoreError::RocksDb(error)))?
+        {
+            let value_result: Result<PendingDownloadRecord, serde_cbor::Error> =
+                value.to_vec().try_into();
+            if let Ok(record) = value_result {
+                return Ok(record
+                    .downloaded_chunks
+                    .keys()
+                    .map(|value| *value as u64)
+                    .collect());
+            }
+        }
+
+        Err(super::Error::FailedToGetDownloadedChunks)
+    }
+
+    fn chunk_downloaded_in_pending_downloads(
+        &self,
+        id: &FileProcessResultHash,
+        chunk_id: usize,
+    ) -> Result<bool, super::Error> {
+        let cf = self.column_family(PENDING_DOWNLOADS_COLUMN_FAMILY_NAME)?;
+        if let Some(value) = self
+            .db
+            .get_cf(cf, id.to_bytes())
+            .map_err(|error| super::Error::RocksDbStore(RocksDbStoreError::RocksDb(error)))?
+        {
+            let value_result: Result<PendingDownloadRecord, serde_cbor::Error> =
+                value.to_vec().try_into();
+            if let Ok(record) = value_result {
+                return Ok(record.downloaded_chunks.contains_key(&chunk_id));
+            }
+        }
+
+        Err(super::Error::FailedToGetDownloadedChunks)
+    }
+
+    fn fetch_pending_downloaded_chunk_path(
+        &self,
+        id: &FileProcessResultHash,
+        chunk_id: usize,
+    ) -> Result<Option<PathBuf>, super::Error> {
+        let cf = self.column_family(PENDING_DOWNLOADS_COLUMN_FAMILY_NAME)?;
+        let raw_published_file_result = self
+            .db
+            .get_cf(cf, id.to_bytes())
+            .map_err(|error| super::Error::RocksDbStore(RocksDbStoreError::RocksDb(error)))?;
+        if raw_published_file_result.is_none() {
+            return Ok(None);
+        }
+        let raw_published_file = raw_published_file_result.unwrap();
+        let published_file: PendingDownloadRecord = raw_published_file
+            .to_vec()
+            .try_into()
+            .map_err(|error| super::Error::RocksDbStore(RocksDbStoreError::Cbor(error)))?;
+        Ok(Some(
+            published_file
+                .download_path
+                .join(format!("{}.{}", chunk_id, CHUNK_FILES_EXTENSION)),
+        ))
     }
 }

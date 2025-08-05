@@ -46,11 +46,13 @@ const LOG_TARGET: &str = "app::p2p::P2pService";
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileChunkRequest {
     pub file_id: u64,
+    pub chunk_id: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FileChunkResponse {
-    pub data: Vec<u8>,
+pub enum FileChunkResponse {
+    Success(Vec<u8>),
+    Error(String),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -294,7 +296,7 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
         }
     }
 
-    fn handle_file_download_message(
+    async fn handle_file_download_message(
         &self,
         swarm: &mut Swarm<P2pNetworkBehaviour>,
         peer_id: PeerId,
@@ -306,14 +308,129 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
                 request,
                 channel,
             } => {
-                info!(target: LOG_TARGET, "File download request: {request:?}");
-                // TODO: implement
+                info!(target: LOG_TARGET, "File chunk download request: {request:?}");
+
+                // we already have the whole file, so we have all the chunks too
+                if let Ok(true) = self.file_store.published_file_exists(request.file_id) {
+                    let chunk_file_path_result = self.file_store.fetch_published_file_chunk_path(
+                        &FileProcessResultHash::new(request.file_id),
+                        request.chunk_id,
+                    );
+                    match chunk_file_path_result {
+                        Ok(Some(chunk_path)) => {
+                            let file_content_result = tokio::fs::read(chunk_path).await;
+                            match file_content_result {
+                                Ok(file_content) => {
+                                    if let Err(error) =
+                                        swarm.behaviour_mut().file_download.send_response(
+                                            channel,
+                                            FileChunkResponse::Success(file_content),
+                                        )
+                                    {
+                                        error!(target: LOG_TARGET, "Failed to send back file chunk download response: {error:?}");
+                                    }
+                                }
+                                Err(error) => {
+                                    if let Err(error) =
+                                        swarm.behaviour_mut().file_download.send_response(
+                                            channel,
+                                            FileChunkResponse::Error(format!(
+                                                "Failed to read chunk locally: {}",
+                                                error.to_string()
+                                            )),
+                                        )
+                                    {
+                                        error!(target: LOG_TARGET, "Failed to send back file chunk download response: {error:?}");
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            if let Err(error) = swarm.behaviour_mut().file_download.send_response(
+                                channel,
+                                FileChunkResponse::Error("Chunk not found".to_string()),
+                            ) {
+                                error!(target: LOG_TARGET, "Failed to send back file chunk download response: {error:?}");
+                            }
+                        }
+                        Err(error) => {
+                            if let Err(error) = swarm
+                                .behaviour_mut()
+                                .file_download
+                                .send_response(channel, FileChunkResponse::Error(error.to_string()))
+                            {
+                                error!(target: LOG_TARGET, "Failed to send back file chunk download response: {error:?}");
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // we have our chunk downloaded as a pending download
+                if let Ok(true) = self.file_store.chunk_downloaded_in_pending_downloads(
+                    &FileProcessResultHash::new(request.file_id),
+                    request.chunk_id,
+                ) {
+                    let chunk_file_path_result =
+                        self.file_store.fetch_pending_downloaded_chunk_path(
+                            &FileProcessResultHash::new(request.file_id),
+                            request.chunk_id,
+                        );
+                    match chunk_file_path_result {
+                        Ok(Some(chunk_path)) => {
+                            let file_content_result = tokio::fs::read(chunk_path).await;
+                            match file_content_result {
+                                Ok(file_content) => {
+                                    if let Err(error) =
+                                        swarm.behaviour_mut().file_download.send_response(
+                                            channel,
+                                            FileChunkResponse::Success(file_content),
+                                        )
+                                    {
+                                        error!(target: LOG_TARGET, "Failed to send back file chunk download response: {error:?}");
+                                    }
+                                }
+                                Err(error) => {
+                                    if let Err(error) =
+                                        swarm.behaviour_mut().file_download.send_response(
+                                            channel,
+                                            FileChunkResponse::Error(format!(
+                                                "Failed to read chunk locally: {}",
+                                                error.to_string()
+                                            )),
+                                        )
+                                    {
+                                        error!(target: LOG_TARGET, "Failed to send back file chunk download response: {error:?}");
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            if let Err(error) = swarm.behaviour_mut().file_download.send_response(
+                                channel,
+                                FileChunkResponse::Error("Chunk not found".to_string()),
+                            ) {
+                                error!(target: LOG_TARGET, "Failed to send back file chunk download response: {error:?}");
+                            }
+                        }
+                        Err(error) => {
+                            if let Err(error) = swarm
+                                .behaviour_mut()
+                                .file_download
+                                .send_response(channel, FileChunkResponse::Error(error.to_string()))
+                            {
+                                error!(target: LOG_TARGET, "Failed to send back file chunk download response: {error:?}");
+                            }
+                        }
+                    }
+                }
             }
             request_response::Message::Response {
                 request_id,
                 response,
             } => {
                 info!(target: LOG_TARGET, "File download response received: {response:?}");
+                // TODO: send back response if matching with any P2P command request
                 // TODO: implement
             }
         }
@@ -575,7 +692,7 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
                     let metadata_result: Result<FileProcessResult, serde_cbor::Error> =
                         serde_cbor::from_slice(metada_content_raw.as_slice());
                     if let Ok(metadata) = metadata_result {
-                        info!(target: LOG_TARGET, "Start providing {} on kademlia DHT...", published_file.original_file_name);
+                        info!(target: LOG_TARGET, "Start providing {} on kademlia DHT ({})...", published_file.original_file_name, published_file.id.raw_hash());
                         if let Ok(value) = serde_cbor::to_vec(&PublishedFile::new(
                             metadata.number_of_chunks,
                             metadata.merkle_root,
@@ -666,7 +783,7 @@ impl<F: file_store::Store + Send + Sync + 'static> Service for P2pService<F> {
                         P2pNetworkBehaviourEvent::RelayClient(event) => self.log_debug(event),
                         P2pNetworkBehaviourEvent::Dcutr(event) => self.log_debug(event),
                         P2pNetworkBehaviourEvent::FileDownload(event) => match event {
-                            request_response::Event::Message { peer, message } => self.handle_file_download_message(&mut swarm, peer, message),
+                            request_response::Event::Message { peer, message } => self.handle_file_download_message(&mut swarm, peer, message).await,
                             _ => self.log_debug(event),
                         },
                         P2pNetworkBehaviourEvent::MetadataDownload(event) => match event {

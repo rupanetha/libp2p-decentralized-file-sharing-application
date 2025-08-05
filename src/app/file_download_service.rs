@@ -1,7 +1,11 @@
 use async_channel::Receiver;
 use async_trait::async_trait;
 use log::{error, info};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{mpsc, Arc},
+    time::Duration,
+};
 use tokio::{
     fs::File,
     sync::{broadcast, RwLock},
@@ -52,17 +56,22 @@ impl<F: file_store::Store + Send + Sync + 'static> FileDownloadService<F> {
     async fn file_chunk_download_worker(
         worker_id: usize,
         chunk_download_rx: Receiver<FileChunkDownload>,
+        success_tx: mpsc::Sender<usize>,
     ) {
         info!(target: LOG_TARGET, "File chunk download worker #{worker_id} has been started!");
         while let Ok(chunk_download) = chunk_download_rx.recv().await {
             info!(target: LOG_TARGET, "Received file chunk: {:?}", chunk_download);
-            // TODO: check why merkle proof can be empty
-            // TODO: implement chunk download process
+            // TODO: implement chunk download process (by calling P2P command)
+            // TODO: handle P2P command response:
+            // TODO: Error case: log the error and retry the operation (so possibly other peer will be asked in P2P service)
+            // TODO: Success case: save the file to downloads folder and send back success
+            success_tx.send(chunk_download.chunk_id);
         }
         info!(target: LOG_TARGET, "File chunk download worker #{worker_id} has been finished!");
     }
 
     async fn start_file_download(
+        file_store: Arc<F>,
         number_of_workers: u64,
         record: PendingDownloadRecord,
     ) -> anyhow::Result<()> {
@@ -71,29 +80,52 @@ impl<F: file_store::Store + Send + Sync + 'static> FileDownloadService<F> {
         let metadata: FileProcessResult = serde_cbor::from_reader(metadata_file.into_std().await)?;
         let (download_channel_tx, download_channel_rx) =
             async_channel::bounded::<FileChunkDownload>(100);
-        let number_of_workers = if metadata.number_of_chunks < number_of_workers as usize {
-            metadata.number_of_chunks
+        let (chunk_download_success_tx, chunk_download_success_rx) = mpsc::channel::<usize>();
+
+        let downloaded_chunk_ids =
+            file_store.already_downloaded_chunks_in_pending_download(&record.id)?;
+
+        let rest_of_chunks = metadata.number_of_chunks - downloaded_chunk_ids.len();
+        let number_of_workers = if rest_of_chunks < number_of_workers as usize {
+            rest_of_chunks
         } else {
             number_of_workers as usize
         };
+
+        // spwaning workers
         for i in 0..number_of_workers {
             let dl_channel = download_channel_rx.clone();
+            let success_tx = chunk_download_success_tx.clone();
             tokio::spawn(async move {
-                Self::file_chunk_download_worker(
-                    i,
-                    dl_channel,
-                    ).await;
+                Self::file_chunk_download_worker(i, dl_channel, success_tx).await;
             });
         }
+
         for i in 0..metadata.number_of_chunks {
+            if downloaded_chunk_ids.contains(&(i as u64)) {
+                continue;
+            }
             if let Some(merkle_proof) = metadata.merkle_proofs.get(&i) {
-                if let Err(error) = download_channel_tx.send(FileChunkDownload::new(i, metadata.merkle_root.clone(), merkle_proof.clone())).await {
+                if let Err(error) = download_channel_tx
+                    .send(FileChunkDownload::new(
+                        i,
+                        metadata.merkle_root.clone(),
+                        merkle_proof.clone(),
+                    ))
+                    .await
+                {
                     error!(target: LOG_TARGET, "Failed to send file chunk to download: {error:?}");
                 }
             }
         }
 
-        // TODO: spawn a tokio task to check how many chunks have been downloaded and manage removal of pending download
+        // waiting for results
+        let record_id = record.id;
+        while let Ok(chunk_id) = chunk_download_success_rx.recv() {
+            file_store.add_downloaded_chunk_to_pending_download(record_id.clone(), chunk_id)?;
+            // TODO: trigger here to provide chunk on DHT (via P2P command)
+        }
+
         // TODO: and add new record to normal providers column family
 
         Ok(())
@@ -120,8 +152,14 @@ impl<F: file_store::Store + Send + Sync + 'static> FileDownloadService<F> {
                         let pending_dl = pending_download.clone();
                         let downloads_lock = self.downloads.clone();
                         let worker_count = self.worker_count_per_file;
+                        let file_store = self.file_store.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = Self::start_file_download(worker_count, pending_dl.clone()).await
+                            if let Err(error) = Self::start_file_download(
+                                file_store,
+                                worker_count,
+                                pending_dl.clone(),
+                            )
+                            .await
                             {
                                 error!(target: LOG_TARGET, "Failed to start downloading file ({}): {error:?}", pending_dl.original_file_name);
                                 let mut downloads = downloads_lock.write().await;
