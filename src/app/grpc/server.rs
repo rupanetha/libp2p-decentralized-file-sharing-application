@@ -64,22 +64,6 @@ impl<F: file_store::Store + Send + Sync + 'static> Dfs for DfsGrpcService<F> {
         let file_processor = file_processor::Processor::new();
         let file_process_result = file_processor.process_file(&request).await?;
 
-        // // TODO: remove, only for testing
-        // let proof = file_process_result.merkle_proofs.get(&10).unwrap();
-        // let proof = MerkleProof::<Sha256>::try_from(proof.as_slice()).unwrap();
-        // let chunk_content = tokio::fs::read(file_process_result.chunks_directory.join("10.chunk"))
-        //     .await
-        //     .unwrap();
-        // let chunk_hash = Sha256::hash(chunk_content.as_slice());
-        // let valid = proof.verify(
-        //     file_process_result.merkle_root,
-        //     &[10],
-        //     &[chunk_hash],
-        //     file_process_result.number_of_chunks,
-        // );
-        // info!(target: LOG_TARGET, "10th chunk validity: {valid}");
-
-        // TODO: start providing files on DHT
         // TODO: start broadcasting of this file on gossipsub periodically if it's public
 
         self.file_publish_tx
@@ -136,6 +120,7 @@ impl<F: file_store::Store + Send + Sync + 'static> Dfs for DfsGrpcService<F> {
                 FileProcessResultHash::new(req.file_id),
                 result.original_file_name.clone(),
                 download_path,
+                result.number_of_chunks as u64,
             ))
             .map_err(|error| tonic::Status::from_error(Box::new(error)))?;
 

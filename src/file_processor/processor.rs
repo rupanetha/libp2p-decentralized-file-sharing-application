@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher as _};
 use std::path::PathBuf;
+use std::ptr::hash;
 use tokio::io::AsyncReadExt;
 use tokio::{fs::File, io::BufReader};
 use tonic::Status;
@@ -17,7 +18,7 @@ pub const CHUNK_FILES_EXTENSION: &str = "chunk";
 
 const LOG_TARGET: &str = "file_processor::processor";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileProcessResult {
     pub original_file_name: String,
     pub number_of_chunks: usize,
@@ -27,7 +28,7 @@ pub struct FileProcessResult {
     pub public: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Hash, Eq)]
 pub struct FileProcessResultHash(u64);
 
 impl FileProcessResultHash {
@@ -89,6 +90,15 @@ impl FileProcessResult {
         let mut hasher = Sha256Hasher::default();
         self.hash(&mut hasher);
         FileProcessResultHash(hasher.finish())
+    }
+
+    pub fn merkle_proof_hash(&self, chunk_id: usize) -> Option<FileProcessResultHash> {
+        if let Some(merkle_proof) = self.merkle_proofs.get(&chunk_id) {
+            let mut hasher = Sha256Hasher::default();
+            merkle_proof.hash(&mut hasher);
+            return Some(FileProcessResultHash(hasher.finish()));
+        }
+        None
     }
 }
 

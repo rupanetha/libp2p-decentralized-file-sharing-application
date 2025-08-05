@@ -14,3 +14,14 @@ impl PublishedFile {
         }
     }
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PublishedFileChunk {
+    pub chunk_number: u64,
+}
+
+impl PublishedFileChunk {
+    pub fn new(chunk_number: u64) -> Self {
+        Self { chunk_number }
+    }
+}

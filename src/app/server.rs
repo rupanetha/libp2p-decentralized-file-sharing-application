@@ -109,7 +109,8 @@ impl Server {
         self.spawn_task(grpc_service).await?;
 
         // file download service
-        let file_download_service = FileDownloadService::new(file_store.clone(), 10);
+        let file_download_service =
+            FileDownloadService::new(file_store.clone(), p2p_command_tx.clone(), 100);
         self.spawn_task(file_download_service).await?;
 
         Ok(())
