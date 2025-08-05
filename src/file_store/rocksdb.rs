@@ -126,7 +126,8 @@ impl Store for RocksDb {
 
     fn fetch_all_pending_downloads(
         &self,
-    ) -> Result<impl Iterator<Item = super::PendingDownloadRecord> + Send + Sync, super::Error> {
+    ) -> Result<impl Iterator<Item = super::PendingDownloadRecord> + Send + Sync, super::Error>
+    {
         let cf = self.column_family(PENDING_DOWNLOADS_COLUMN_FAMILY_NAME)?;
         let iter = self
             .db

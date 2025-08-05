@@ -2324,6 +2324,7 @@ name = "libp2p-file-sharing"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "async-trait",
  "clap",
  "clap_derive",
