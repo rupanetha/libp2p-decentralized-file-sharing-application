@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use rs_merkle::algorithms::Sha256;
 use rs_merkle::{Hasher, MerkleTree};
 use rs_sha256::Sha256Hasher;
@@ -5,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher as _};
 use std::path::PathBuf;
-use std::ptr::hash;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::{fs::File, io::BufReader};
 use tonic::Status;
 
@@ -227,5 +228,35 @@ impl Processor {
         })?;
 
         Ok(result)
+    }
+
+    pub async fn process_downloaded_file(
+        &self,
+        download_dir: PathBuf,
+        metadata: &FileProcessResult,
+    ) -> anyhow::Result<()> {
+        let result_file_path = download_dir.join(metadata.original_file_name.as_str());
+        let mut result_file = tokio::fs::File::create(result_file_path).await?;
+        let mut merkle_tree = MerkleTree::<Sha256>::new();
+        for i in 0..metadata.number_of_chunks {
+            let chunk_data =
+                tokio::fs::read(download_dir.join(format!("{}.{}", i, CHUNK_FILES_EXTENSION)))
+                    .await?;
+            merkle_tree.insert(Sha256::hash(chunk_data.as_slice()));
+            result_file.write(chunk_data.as_slice()).await?;
+        }
+        result_file.flush().await?;
+
+        // finalizing merkle tree
+        merkle_tree.commit();
+        let current_merkle_root = merkle_tree.root().ok_or(Status::internal(
+            "Failed to get merkle root hash for chunks!",
+        ))?;
+
+        if current_merkle_root != metadata.merkle_root {
+            return Err(anyhow!("Invalid file, merkle root mismatch!"));
+        }
+
+        Ok(())
     }
 }

@@ -1,5 +1,6 @@
 use std::{option::Iter, path::PathBuf};
 
+use libp2p::kad::RecordKey;
 use log::error;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options};
 use thiserror::Error;
@@ -15,7 +16,6 @@ const LOG_TARGET: &str = "file_store::rocksdb";
 
 const PUBLISHED_FILES_COLUMN_FAMILY_NAME: &str = "published_files";
 const PENDING_DOWNLOADS_COLUMN_FAMILY_NAME: &str = "pending_downloads";
-const DOWNLOAD_PROGRESSES_COLUMN_FAMILY_NAME: &str = "download_progresses";
 
 pub struct RocksDb {
     db: rocksdb::DB,
@@ -133,6 +133,27 @@ impl Store for RocksDb {
                 .join(format!("{}.{}", chunk_id, CHUNK_FILES_EXTENSION)),
         ))
     }
+    fn fetch_all_public_published_files(
+        &self,
+    ) -> Result<impl Iterator<Item = PublishedFileRecord> + Send + Sync, super::Error> {
+        let cf = self.column_family(PUBLISHED_FILES_COLUMN_FAMILY_NAME)?;
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::Start)
+            .filter_map(|result| {
+                if let Ok((_, value)) = result {
+                    let value_result: Result<PublishedFileRecord, serde_cbor::Error> =
+                        value.to_vec().try_into();
+                    if let Ok(record) = value_result {
+                        if record.public {
+                            return Some(record);
+                        }
+                    }
+                }
+                None
+            });
+        Ok(iter)
+    }
 
     fn add_pending_download(
         &self,
@@ -145,6 +166,15 @@ impl Store for RocksDb {
             .map_err(|error| RocksDbStoreError::Cbor(error))?;
         self.db
             .put_cf(cf, key, value)
+            .map_err(|error| RocksDbStoreError::RocksDb(error))?;
+        Ok(())
+    }
+
+    fn remove_pending_download(&self, id: FileProcessResultHash) -> Result<(), super::Error> {
+        let cf = self.column_family(PENDING_DOWNLOADS_COLUMN_FAMILY_NAME)?;
+        let key = RecordKey::new(&id.to_array());
+        self.db
+            .delete_cf(cf, key)
             .map_err(|error| RocksDbStoreError::RocksDb(error))?;
         Ok(())
     }

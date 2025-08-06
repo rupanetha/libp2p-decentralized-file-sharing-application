@@ -1,17 +1,21 @@
 use std::net::AddrParseError;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use log::{error, info};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
-use tonic::{Request, Response};
+use tonic::{Request, Response, Status};
 
 use crate::app::dfs_grpc::dfs_server::DfsServer;
 use crate::app::dfs_grpc::PublishFileResponse;
+use crate::app::models::PublicPublishedFile;
 use crate::app::service::{MetadataDownloadRequest, P2pCommand};
 use crate::app::{ServerError, Service};
 use crate::file_processor::{
@@ -20,7 +24,10 @@ use crate::file_processor::{
 use crate::file_store::{self, PendingDownloadRecord};
 
 use super::dfs_grpc::dfs_server::Dfs;
-use super::dfs_grpc::{DownloadRequest, DownloadResponse, PublishFileRequest};
+use super::dfs_grpc::{
+    DownloadRequest, DownloadResponse, GetPublicFileResponse, GetPublicFilesRequest,
+    PublishFileRequest,
+};
 
 const LOG_TARGET: &str = "grpc";
 
@@ -51,8 +58,12 @@ impl<F: file_store::Store + Send + Sync + 'static> DfsGrpcService<F> {
     }
 }
 
+type ResponseStream = Pin<Box<dyn Stream<Item = Result<GetPublicFileResponse, Status>> + Send>>;
+
 #[tonic::async_trait]
 impl<F: file_store::Store + Send + Sync + 'static> Dfs for DfsGrpcService<F> {
+    type GetPublicFilesStream = ResponseStream;
+
     async fn publish_file(
         &self,
         request: Request<PublishFileRequest>,
@@ -131,6 +142,39 @@ impl<F: file_store::Store + Send + Sync + 'static> Dfs for DfsGrpcService<F> {
             success: true,
             error: "".to_string(),
         }))
+    }
+
+    async fn get_public_files(
+        &self,
+        request: tonic::Request<GetPublicFilesRequest>,
+    ) -> Result<Response<ResponseStream>, tonic::Status> {
+        let (response_tx, mut response_rx) =
+            tokio::sync::mpsc::channel::<Result<GetPublicFileResponse, Status>>(100);
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<PublicPublishedFile>(100);
+        self.p2p_command_sender
+            .send(P2pCommand::GetPublicFiles { result: result_tx })
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!(
+                    "Failed to send P2P command to get public files available: {error:?}"
+                ))
+            })?;
+        if let Some(result) = result_rx.recv().await {
+            response_tx
+                .send(Ok(GetPublicFileResponse {
+                    id: result.id.raw_hash(),
+                    original_file_name: result.original_file_name.clone(),
+                }))
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!("Failed to send result: {error:?}"))
+                })?;
+        }
+
+        let output_stream = ReceiverStream::new(response_rx);
+        Ok(Response::new(
+            Box::pin(output_stream) as Self::GetPublicFilesStream
+        ))
     }
 }
 

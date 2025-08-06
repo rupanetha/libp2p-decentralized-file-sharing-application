@@ -4,6 +4,7 @@ package dfs_grpc;
 service Dfs {
     rpc PublishFile (PublishFileRequest) returns (PublishFileResponse);
     rpc download (DownloadRequest) returns (DownloadResponse);
+    rpc GetPublicFiles (GetPublicFilesRequest) returns (stream GetPublicFilesResponse);
 }
 
 message PublishFileRequest {
@@ -24,4 +25,11 @@ message DownloadRequest {
 message DownloadResponse {
     bool success = 1;
     string error = 2;
+}
+
+message GetPublicFileRequest {}
+
+message GetPublicFileResponse {
+    uint64 file_id = 1;
+    string file_path = 2;
 }

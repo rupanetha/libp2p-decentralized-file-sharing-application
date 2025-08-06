@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
@@ -41,12 +41,13 @@ use crate::{
         ServerError, Service,
     },
     file_processor::{FileProcessResult, FileProcessResultHash, PROCESSING_RESULT_FILE_NAME},
-    file_store::{self},
+    file_store::{self, PublishedFileRecord},
 };
 
-use super::config::P2pServiceConfig;
+use super::{config::P2pServiceConfig, models::PublicPublishedFile};
 
 const LOG_TARGET: &str = "app::p2p::P2pService";
+const GOSSIPSUB_PUBLIC_FILES_TOPIC_NAME: &str = "public_files";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileChunkRequest {
@@ -71,6 +72,19 @@ pub enum MetadataDownloadResponse {
     Error(String),
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProvideFileChunkRequest {
+    pub chunk_id: usize,
+    pub chunk_hash: FileProcessResultHash,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProvideFileRequest {
+    pub file_id: FileProcessResultHash,
+    pub number_of_chunks: usize,
+    pub merkle_root: [u8; 32],
+}
+
 pub enum P2pCommand {
     RequestMetadata {
         request: MetadataDownloadRequest,
@@ -79,6 +93,17 @@ pub enum P2pCommand {
     RequestFileChunk {
         request: FileChunkRequest,
         result: oneshot::Sender<Option<Vec<u8>>>,
+    },
+    ProvideFileChunk {
+        request: ProvideFileChunkRequest,
+        result: oneshot::Sender<bool>,
+    },
+    ProvideFile {
+        request: ProvideFileRequest,
+        result: oneshot::Sender<bool>,
+    },
+    GetPublicFiles {
+        result: tokio::sync::mpsc::Sender<PublicPublishedFile>,
     },
 }
 
@@ -140,6 +165,7 @@ pub struct P2pService<F: file_store::Store + Send + Sync + 'static> {
     commands_rx: mpsc::Receiver<P2pCommand>,
     metadata_download_requests: Vec<MetadataDownloadRequestData>,
     file_chunk_download_requests: Vec<FileChunkDownloadRequestData>,
+    public_files: HashSet<PublicPublishedFile>,
 }
 
 impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
@@ -156,6 +182,7 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
             commands_rx,
             metadata_download_requests: vec![],
             file_chunk_download_requests: vec![],
+            public_files: HashSet::new(),
         }
     }
 
@@ -454,10 +481,9 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
                 request_id,
                 response,
             } => {
-                info!(target: LOG_TARGET, "File download response received: {response:?}");
                 match response {
                     FileChunkResponse::Success { chunk_id, binary } => {
-                        info!(target:LOG_TARGET, "New file chunk downloaded: {:?} ({:?} bytes)", chunk_id, binary.len());
+                        // info!(target:LOG_TARGET, "New file chunk downloaded: {:?} ({:?} bytes)", chunk_id, binary.len());
                         if let Some(data) = self
                             .file_chunk_download_requests
                             .iter_mut()
@@ -570,7 +596,6 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
                 request_id,
                 response,
             } => {
-                info!(target: LOG_TARGET, "Metadata download response received: {response:?}");
                 match response {
                     MetadataDownloadResponse::Success(raw_metadata) => {
                         let metadata_result: Result<FileProcessResult, serde_cbor::Error> =
@@ -627,13 +652,39 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
         }
     }
 
-    fn handle_gossipsub_message(
+    fn handle_public_file(
         &self,
+        swarm: &mut Swarm<P2pNetworkBehaviour>,
+        file: &PublishedFileRecord,
+    ) {
+        let file_data: PublicPublishedFile = file.into();
+        if let Ok(data) = serde_cbor::to_vec(&file_data) {
+            if let Err(error) = swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(IdentTopic::new(GOSSIPSUB_PUBLIC_FILES_TOPIC_NAME), data)
+            {
+                error!(target: LOG_TARGET, "Failed to publish public file: {error:?}");
+            }
+        }
+    }
+
+    fn handle_gossipsub_message(
+        &mut self,
         swarm: &mut Swarm<P2pNetworkBehaviour>,
         message: libp2p::gossipsub::Message,
     ) {
-        info!(target: LOG_TARGET, "[gossipsub] New message: {message:?}");
-        // TODO: implement
+        if message.topic == IdentTopic::new(GOSSIPSUB_PUBLIC_FILES_TOPIC_NAME).hash() {
+            match serde_cbor::from_slice::<PublicPublishedFile>(message.data.as_slice()) {
+                Ok(public_file) => {
+                    info!(target: LOG_TARGET, "Public file available: {public_file:?}");
+                    self.public_files.insert(public_file);
+                }
+                Err(error) => {
+                    error!(target: LOG_TARGET, "Failed to convert public file data: {error:?}");
+                }
+            }
+        }
     }
 
     fn handle_file_publish(
@@ -710,7 +761,6 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
                 5. After all chunks downloaded and validated, create the final file based on metadata (use original file name) and validate the root hash
                  */
 
-                // TODO: implement p2p req-resp protocol to download a specific chunk
                 // TODO: start publishing new file periodically to other peers via gossipsub if file_process_result.public == true
             }
             Err(error) => {
@@ -720,7 +770,11 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
     }
 
     /// Handling internal P2P requests.
-    fn handle_command(&mut self, swarm: &mut Swarm<P2pNetworkBehaviour>, command: P2pCommand) {
+    async fn handle_command(
+        &mut self,
+        swarm: &mut Swarm<P2pNetworkBehaviour>,
+        command: P2pCommand,
+    ) {
         match command {
             P2pCommand::RequestMetadata { request, result } => {
                 let hash = FileProcessResultHash::new(request.file_id);
@@ -735,7 +789,6 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
                     });
             }
             P2pCommand::RequestFileChunk { request, result } => {
-                info!(target: LOG_TARGET, "RequestFileChunk command received");
                 let hash = FileProcessResultHash::new(request.chunk_id as u64);
                 let key = RecordKey::new(&hash.to_array());
                 let query_id = swarm.behaviour_mut().kademlia.get_providers(key);
@@ -746,6 +799,85 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
                         request,
                         result: Some(result),
                     });
+            }
+            P2pCommand::ProvideFileChunk { request, result } => {
+                match serde_cbor::to_vec(&PublishedFileChunk::new(request.chunk_id as u64)) {
+                    Ok(value) => {
+                        let record = Record::new(request.chunk_hash.to_bytes(), value);
+                        let record_key = record.key.clone();
+                        if let Err(error) = swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .put_record(record, kad::Quorum::Majority)
+                        {
+                            error!(target: LOG_TARGET, "Failed to put a new record to DHT: {error}");
+                            if let Err(_) = result.send(false) {
+                                error!(target: LOG_TARGET, "Failed to send result of provide file chunk call!");
+                            }
+                            return;
+                        }
+                        if let Err(error) =
+                            swarm.behaviour_mut().kademlia.start_providing(record_key)
+                        {
+                            error!(target: LOG_TARGET, "Failed to start providing a new record to DHT: {error}");
+                            if let Err(_) = result.send(false) {
+                                error!(target: LOG_TARGET, "Failed to send result of provide file chunk call!");
+                            }
+                            return;
+                        }
+
+                        if let Err(_) = result.send(true) {
+                            error!(target: LOG_TARGET, "Failed to send result of provide file chunk call!");
+                        }
+                    }
+                    Err(error) => {
+                        error!(target: LOG_TARGET, "Failed to convert published file chunk: {error:?}")
+                    }
+                }
+            }
+            P2pCommand::ProvideFile { request, result } => {
+                match serde_cbor::to_vec(&PublishedFile::new(
+                    request.number_of_chunks,
+                    request.merkle_root,
+                )) {
+                    Ok(value) => {
+                        let record = Record::new(request.file_id.to_bytes(), value);
+                        let record_key = record.key.clone();
+                        if let Err(error) = swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .put_record(record, kad::Quorum::Majority)
+                        {
+                            error!(target: LOG_TARGET, "Failed to put a new record to DHT: {error}");
+                            if let Err(_) = result.send(false) {
+                                error!(target: LOG_TARGET, "Failed to send result of provide file call!");
+                            }
+                            return;
+                        }
+                        if let Err(error) =
+                            swarm.behaviour_mut().kademlia.start_providing(record_key)
+                        {
+                            error!(target: LOG_TARGET, "Failed to start providing a new record to DHT: {error}");
+                            if let Err(_) = result.send(false) {
+                                error!(target: LOG_TARGET, "Failed to send result of provide file call!");
+                            }
+                            return;
+                        }
+                        if let Err(_) = result.send(true) {
+                            error!(target: LOG_TARGET, "Failed to send result of provide file call!");
+                        }
+                    }
+                    Err(error) => {
+                        error!(target: LOG_TARGET, "Failed to convert PublishedFile to cbor: {error:?}");
+                    }
+                }
+            }
+            P2pCommand::GetPublicFiles { result } => {
+                for public_file in &self.public_files {
+                    if let Err(error) = result.send(public_file.clone()).await {
+                        error!(target: LOG_TARGET, "Failed to send public files: {error:?}");
+                    }
+                }
             }
         }
     }
@@ -801,7 +933,6 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
         query_id: QueryId,
         providers_result: &Result<GetProvidersOk, GetProvidersError>,
     ) {
-        info!(target: LOG_TARGET, "handle_get_providers_for_file_chunk_download called");
         if let Some(data) = self
             .file_chunk_download_requests
             .iter()
@@ -848,7 +979,6 @@ impl<F: file_store::Store + Send + Sync + 'static> P2pService<F> {
         result: QueryResult,
     ) {
         if let QueryResult::GetProviders(providers_result) = result {
-            info!(target: LOG_TARGET, "Get providers progressed: {providers_result:?}");
             self.handle_get_providers_for_metadata_download(swarm, query_id, &providers_result);
             self.handle_get_providers_for_file_chunk_download(swarm, query_id, &providers_result);
         }
@@ -942,7 +1072,7 @@ impl<F: file_store::Store + Send + Sync + 'static> Service for P2pService<F> {
 
         info!(target: LOG_TARGET, "Peer ID: {}", swarm.local_peer_id());
 
-        let file_owners_topic = IdentTopic::new("available_files");
+        let file_owners_topic = IdentTopic::new(GOSSIPSUB_PUBLIC_FILES_TOPIC_NAME);
         swarm
             .behaviour_mut()
             .gossipsub
@@ -954,6 +1084,32 @@ impl<F: file_store::Store + Send + Sync + 'static> Service for P2pService<F> {
         // TODO: add bootstrap peers
 
         self.start_providing_all_files(&mut swarm);
+
+        // start broadcasting periodically all published files
+        let (public_file_tx, mut public_file_rx) =
+            tokio::sync::mpsc::channel::<PublishedFileRecord>(100);
+        let store = self.file_store.clone();
+        let cancel = cancel_token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Ok(iter) = store.fetch_all_public_published_files() {
+                            for record in iter {
+                                if let Err(error) = public_file_tx.send(record).await {
+                                    error!(target: LOG_TARGET, "Failed to send public file: {error:?}");
+                                }
+                            }
+                        }
+                    },
+                    _ = cancel.cancelled() => {
+                        info!(target: LOG_TARGET, "P2P public file broadcasting shutting down...");
+                        break;
+                    }
+                }
+            }
+        });
 
         loop {
             select! {
@@ -1005,9 +1161,12 @@ impl<F: file_store::Store + Send + Sync + 'static> Service for P2pService<F> {
                 },
                 command = self.commands_rx.recv() => {
                     if let Some(command) = command {
-                        self.handle_command(&mut swarm, command);
+                        self.handle_command(&mut swarm, command).await;
                     }
                 },
+                Some(public_file) = public_file_rx.recv() => {
+                    self.handle_public_file(&mut swarm, &public_file);
+                }
                 _ = cancel_token.cancelled() => {
                     info!(target: LOG_TARGET, "P2P networking service shutting down...");
                     break;

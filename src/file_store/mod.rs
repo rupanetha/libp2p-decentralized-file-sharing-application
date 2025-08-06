@@ -31,9 +31,13 @@ pub trait Store {
         id: &FileProcessResultHash,
         chunk_id: usize,
     ) -> Result<Option<PathBuf>, Error>;
+    fn fetch_all_public_published_files(
+        &self,
+    ) -> Result<impl Iterator<Item = PublishedFileRecord> + Send + Sync, Error>;
 
     // Pending download operations
     fn add_pending_download(&self, record: PendingDownloadRecord) -> Result<(), Error>;
+    fn remove_pending_download(&self, id: FileProcessResultHash) -> Result<(), Error>;
     fn fetch_all_pending_downloads(
         &self,
     ) -> Result<impl Iterator<Item = PendingDownloadRecord> + Send + Sync, Error>;

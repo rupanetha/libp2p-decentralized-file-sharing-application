@@ -1003,6 +1003,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "dfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "async-trait",
+ "clap",
+ "clap_derive",
+ "ctrlc",
+ "env_logger",
+ "homedir",
+ "libp2p",
+ "log",
+ "prost",
+ "rocksdb",
+ "rs_merkle",
+ "rs_sha256",
+ "serde",
+ "serde_cbor",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2317,33 +2345,6 @@ dependencies = [
  "parking_lot",
  "smallvec",
  "tracing",
-]
-
-[[package]]
-name = "libp2p-file-sharing"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-channel 2.5.0",
- "async-trait",
- "clap",
- "clap_derive",
- "ctrlc",
- "env_logger",
- "homedir",
- "libp2p",
- "log",
- "prost",
- "rocksdb",
- "rs_merkle",
- "rs_sha256",
- "serde",
- "serde_cbor",
- "thiserror 2.0.12",
- "tokio",
- "tokio-util",
- "tonic",
- "tonic-build",
 ]
 
 [[package]]
